@@ -1,17 +1,16 @@
-// Required for: Running the core machine learning pipeline that extracts chords and tempo from user audio.
+// Required for: Running the core machine learning pipeline that extracts chords and tempo from user audio locally.
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Cpu, Link2, Loader2, Mic, Music4, Square, TextSearch, Upload, Wand2 } from "lucide-react";
+import { Link2, Loader2, Mic, Music4, Square, TextSearch, Upload, Wand2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue,} from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { analyzeAudioBuffer, type AnalysisResult } from "@/lib/audio-analysis";
 import { putAudio } from "@/lib/audio-store";
-import { analyzeWithChordMini, analyzeWithTensorFlow, type ChordMiniModels } from "@/lib/chordmini";
 import { importLink } from "@/lib/link-import.functions";
 import { fetchSyncedLyrics, type SyncedLine } from "@/lib/lyrics-fetch.functions";
 import { romanizeLyrics } from "@/lib/lyrics.functions";
@@ -40,9 +39,8 @@ export const Route = createFileRoute("/analyze")({
 });
 
 type Style = "auto" | "hinglish" | "tanglish" | "english";
-type AnalysisEngine = "tensorflow" | "chordmini-auto" | "madmom" | "beat-transformer" | "local";
 
-// Core page where users can upload audio, record mic input, and extract chords/lyrics
+// Core page where users can upload audio, record mic input, and extract chords/lyrics locally
 function AnalyzePage() {
   const { settings } = useAppSettings();
   const navigate = useNavigate();
@@ -63,53 +61,12 @@ function AnalyzePage() {
   const [fetchingLyrics, setFetchingLyrics] = useState(false);
   const [recording, setRecording] = useState(false);
   const [recSecs, setRecSecs] = useState(0);
-  const [beatModel, setBeatModel] = useState<ChordMiniModels["beatModel"]>("auto");
-  const [chordModel] = useState<ChordMiniModels["chordModel"]>("chord-cnn-lstm");
-  const [selectedEngine, setSelectedEngine] = useState<AnalysisEngine>(
-    settings.features.tensorflow_analysis
-      ? "tensorflow"
-      : settings.features.chordmini_analysis
-        ? "chordmini-auto"
-        : "local",
-  );
 
   useEffect(() => {
     if (!recording) return;
     const iv = window.setInterval(() => setRecSecs((s) => s + 1), 1000);
     return () => window.clearInterval(iv);
   }, [recording]);
-
-  useEffect(() => {
-    setSelectedEngine((current) => {
-      const isChordMini = current !== "tensorflow" && current !== "local";
-      if (current === "tensorflow" && !settings.features.tensorflow_analysis) {
-        return settings.features.chordmini_analysis
-          ? "chordmini-auto"
-          : settings.features.local_analysis
-            ? "local"
-            : current;
-      }
-      if (isChordMini && !settings.features.chordmini_analysis) {
-        return settings.features.tensorflow_analysis
-          ? "tensorflow"
-          : settings.features.local_analysis
-            ? "local"
-            : current;
-      }
-      if (current === "local" && !settings.features.local_analysis) {
-        return settings.features.tensorflow_analysis
-          ? "tensorflow"
-          : settings.features.chordmini_analysis
-            ? "chordmini-auto"
-            : current;
-      }
-      return current;
-    });
-  }, [
-    settings.features.chordmini_analysis,
-    settings.features.local_analysis,
-    settings.features.tensorflow_analysis,
-  ]);
 
   // Grabs the selected file from the hidden file input and auto-fills the song title
   function onPick(f: File | null) {
@@ -197,108 +154,54 @@ function AnalyzePage() {
     }
   }
 
-  // The main execution pipeline: decodes audio, runs the selected machine learning model, and saves the result
+  // The main execution pipeline: decodes audio, runs the local browser model, and saves the result
   async function run() {
     if (!file) {
       toast.error("Choose an audio file first");
       return;
     }
+    
     setBusy(true);
     setProgress(2);
     setStage("Decoding audio");
+    
     try {
       const arrayBuffer = await file.arrayBuffer();
       const ctx = new OfflineAudioContext(1, 1, 22050);
       const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
 
       let analysis: AnalysisResult | null = null;
-      let engine: "tensorflow" | "chordmini" | "local" = "local";
-      let models: ChordMiniModels | undefined;
+      
+      setStage("Analysing on device (offline)");
+      setProgress(15);
 
-      if (selectedEngine === "tensorflow" && settings.features.tensorflow_analysis) {
-        setStage("Analysing with your TensorFlow model");
-        setProgress(15);
-        const outcome = await analyzeWithTensorFlow(file, decoded.duration);
-        if (outcome.ok) {
-          analysis = outcome.analysis;
-          engine = "tensorflow";
-          setProgress(85);
-        } else {
-          toast.warning(
-            settings.features.chordmini_analysis
-              ? `${outcome.reason} — trying ChordMini instead`
-              : settings.features.local_analysis
-                ? `${outcome.reason} — analysing on device instead`
-                : outcome.reason,
-          );
-          if (settings.features.chordmini_analysis) {
-            setStage("TensorFlow unavailable — trying ChordMini");
-            const fallback = await analyzeWithChordMini(file, decoded.duration, {
-              beatModel: "auto",
-              chordModel,
-            });
-            if (fallback.ok) {
-              analysis = fallback.analysis;
-              engine = "chordmini";
-              models = fallback.models;
-              setProgress(85);
-            }
-          }
-        }
-      }
+      // Downsample to 22.05 kHz mono for a faster, cleaner chromagram.
+      const off = new OfflineAudioContext(
+        1,
+        Math.ceil((decoded.duration * 22050) as number),
+        22050,
+      );
+      const src = off.createBufferSource();
+      src.buffer = decoded;
+      src.connect(off.destination);
+      src.start();
+      const mono = await off.startRendering();
 
-      if (
-        !analysis &&
-        selectedEngine !== "tensorflow" &&
-        selectedEngine !== "local" &&
-        settings.features.chordmini_analysis
-      ) {
-        setStage("Analysing with ChordMini");
-        setProgress(15);
-        const outcome = await analyzeWithChordMini(file, decoded.duration, {
-          beatModel: selectedEngine === "chordmini-auto" ? "auto" : selectedEngine,
-          chordModel,
-        });
-        if (outcome.ok) {
-          analysis = outcome.analysis;
-          engine = "chordmini";
-          models = outcome.models;
-          setProgress(85);
-        } else {
-          toast.warning(
-            settings.features.local_analysis
-              ? `${outcome.reason} — analysing on device instead`
-              : outcome.reason,
-          );
-        }
-      }
+      // Execute purely local client-side DSP chord recognition
+      analysis = await analyzeAudioBuffer(mono, {
+        onProgress: (p, s) => {
+          setProgress(Math.min(85, p * 0.85));
+          setStage(s);
+        },
+      });
 
-      if (!analysis && settings.features.local_analysis) {
-        // Downsample to 22.05 kHz mono for a faster, cleaner chromagram.
-        const off = new OfflineAudioContext(
-          1,
-          Math.ceil((decoded.duration * 22050) as number),
-          22050,
-        );
-        const src = off.createBufferSource();
-        src.buffer = decoded;
-        src.connect(off.destination);
-        src.start();
-        const mono = await off.startRendering();
-
-        analysis = await analyzeAudioBuffer(mono, {
-          onProgress: (p, s) => {
-            setProgress(Math.min(85, p * 0.85));
-            setStage(s);
-          },
-        });
-      }
       if (!analysis) {
-        throw new Error("No analysis engine is available right now.");
+        throw new Error("Local analysis failed.");
       }
 
       let lyricText = lyrics;
       let syncedLines = synced;
+      
       if (!lyricText.trim() && title.trim() && settings.features.lyrics_lookup) {
         setStage("Looking up lyrics");
         setProgress(88);
@@ -323,6 +226,7 @@ function AnalyzePage() {
       setStage("Saving");
       setProgress(97);
       await putAudio(id, file);
+      
       saveSong({
         id,
         title: title.trim() || "Untitled",
@@ -335,19 +239,14 @@ function AnalyzePage() {
         capo: 0,
         transpose: 0,
         notes: "",
-        engine,
-        ...(models ? { models } : {}),
+        engine: "local",
         ...(syncedLines.length ? { syncedLyrics: syncedLines } : {}),
       });
+      
       setProgress(100);
-      toast.success(
-        engine === "tensorflow"
-          ? "Analysed with your TensorFlow model"
-          : engine === "chordmini"
-            ? "Analysed with ChordMini"
-            : "Analysis complete (on device)",
-      );
+      toast.success("Analysis complete (on device)");
       void navigate({ to: "/song/$id", params: { id } });
+      
     } catch (e) {
       console.error(e);
       toast.error(e instanceof Error ? e.message : "Could not analyze that file");
@@ -357,11 +256,10 @@ function AnalyzePage() {
   }
 
   return (
-    <div className="mx-auto max-w-lg px-4 pt-6">
+    <div className="mx-auto max-w-lg px-4 pt-6 pb-24">
       <h1 className="text-2xl font-semibold tracking-tight">Analyze a song</h1>
       <p className="mt-1 text-sm text-muted-foreground">
-        Your TensorFlow chord model runs through the Python API, with ChordMini and on-device
-        analysis as fallbacks.
+        Everything runs locally on your device — your audio never leaves the browser.
       </p>
 
       <div className="panel mt-5 p-4">
@@ -442,48 +340,6 @@ function AnalyzePage() {
       </div>
 
       <div className="panel mt-4 p-4">
-        <div className="flex items-center gap-2">
-          <Cpu className="size-4 text-primary" />
-          <Label>Analysis engine</Label>
-        </div>
-        <Select
-          value={selectedEngine}
-          onValueChange={(v) => {
-            setSelectedEngine(v as AnalysisEngine);
-            if (v === "madmom" || v === "beat-transformer") setBeatModel(v);
-          }}
-        >
-          <SelectTrigger className="mt-2">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {settings.features.tensorflow_analysis && (
-              <SelectItem value="tensorflow">Your TensorFlow model · API</SelectItem>
-            )}
-            {settings.features.chordmini_analysis && (
-              <>
-                <SelectItem value="chordmini-auto">ChordMini · auto beat model</SelectItem>
-                <SelectItem value="madmom">ChordMini · madmom (fast, 3/4 &amp; 4/4)</SelectItem>
-                <SelectItem value="beat-transformer">
-                  ChordMini · beat-transformer (slow, complex mixes)
-                </SelectItem>
-              </>
-            )}
-            {settings.features.local_analysis && (
-              <SelectItem value="local">On-device only (offline)</SelectItem>
-            )}
-          </SelectContent>
-        </Select>
-        <p className="mt-2 text-xs text-muted-foreground">
-          {selectedEngine === "tensorflow"
-            ? "Your trained TensorFlow model recognizes chords in the Python API, with ChordMini and on-device analysis as fallbacks."
-            : selectedEngine !== "local"
-              ? "ChordMini provides remote beat and chord recognition; on-device analysis is used if it is unavailable."
-              : "Everything runs on your device — your audio never leaves the phone."}
-        </p>
-      </div>
-
-      <div className="panel mt-4 p-4">
         <div className="flex items-center justify-between gap-2">
           <Label htmlFor="lyrics">Lyrics (optional)</Label>
           {settings.features.lyrics_lookup && <Button
@@ -546,6 +402,7 @@ function AnalyzePage() {
         </div>
       )}
 
+      {/* Button is disabled if processing is busy, OR if there is no file selected */}
       <Button size="lg" className="mt-5 w-full" onClick={run} disabled={busy || !file}>
         <Wand2 className="size-4" />
         {busy ? "Analyzing…" : "Detect chords"}

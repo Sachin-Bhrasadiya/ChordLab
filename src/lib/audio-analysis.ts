@@ -755,7 +755,6 @@ function temporalSmooth(vecs: Float32Array[], w = 0.35): Float32Array[] {
   });
 }
 
-
 function matchChord(vec: Float32Array): { label: string; score: number } {
   const scores = templateScores(vec, null, null);
   let best = { label: "N", score: -Infinity };
